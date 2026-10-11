@@ -1,0 +1,17 @@
+services:
+  db:
+    image: mysql:8
+    environment: { MYSQL_DATABASE: filmfest, MYSQL_ROOT_PASSWORD: secret }
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-psecret"], interval: 5s, retries: 20 }
+    volumes: [dbdata:/var/lib/mysql]
+  app:
+    build: .
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      DB_URL: jdbc:mysql://db:3306/filmfest?useSSL=false&allowPublicKeyRetrieval=true
+      DB_USER: root
+      DB_PASS: secret
+      UPLOAD_DIR: /data/posters
+    volumes: [posters:/data/posters]
+    ports: ["8080:8080"]
+volumes: { dbdata: {}, posters: {} }
