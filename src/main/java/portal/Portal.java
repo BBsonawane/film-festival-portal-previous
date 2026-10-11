@@ -96,6 +96,12 @@ public class Portal extends HttpServlet {
                     case "/pay" -> { guard(s, "FILMMAKER"); if (post) { settle(Integer.parseInt(need(q, "id")), uid, "SUCCESS".equals(q.getParameter("result"))); r.sendRedirect("/dashboard"); } else payPage(q, r, uid); }
                     case "/assign" -> { guard(s, "NONFILMMAKER"); assign(q, r, uid); }
                     case "/review" -> { guard(s, "NONFILMMAKER"); if (post) saveScores(q, r, uid); else review(q, r, uid); }
+                    case "/festival/close-scoring" -> { guard(s, "NONFILMMAKER"); postOnly(q); closeScoring(q, r, uid); }
+                    case "/festival/tally" -> { guard(s, "NONFILMMAKER"); postOnly(q); tally(q, r, uid); }
+                    case "/festival/publish" -> { guard(s, "NONFILMMAKER"); postOnly(q); publish(q, r, uid); }
+                    case "/discuss" -> { guard(s, "NONFILMMAKER"); discuss(q, r, uid); }
+                    case "/comment" -> { guard(s, "NONFILMMAKER"); postOnly(q); comment(q, r, uid); }
+                    case "/vote" -> { guard(s, "NONFILMMAKER"); postOnly(q); vote(q, r, uid); }
                     case "/poster" -> poster(q, r);
                     default -> r.sendError(404);
                 }
@@ -163,7 +169,9 @@ public class Portal extends HttpServlet {
             }
             b.append("</tr>");
         }
-        b.append("</table><h4 class=mt-4>Audit trail</h4><ul class=list-unstyled>");
+        b.append("</table>");
+        adminStage(b, id);
+        b.append("<h4 class=mt-4>Audit trail</h4><ul class=list-unstyled>");
         for (var a : db("SELECT action,detail,created_at FROM audit_log WHERE festival_id=? ORDER BY id DESC LIMIT 30", id))
             b.append("<li>").append(e(a.get("created_at"))).append(" — ").append(e(a.get("action"))).append(" ").append(e(a.get("detail"))).append("</li>");
         page(q, r, b.append("</ul>").toString());
@@ -207,6 +215,8 @@ public class Portal extends HttpServlet {
             }
         }
         if (role.equals("NONFILMMAKER")) {
+            for (var d : db("SELECT f.id,f.name FROM festivals f JOIN festival_state fs ON fs.festival_id=f.id WHERE fs.stage IN ('VOTE','DECIDED') AND (f.admin_id=? OR EXISTS (SELECT 1 FROM jury_requests j WHERE j.festival_id=f.id AND j.user_id=? AND j.status='APPROVED'))", uid, uid))
+                b.append("<p class=mt-4><a class='btn btn-primary' href='/discuss?festival=").append(d.get("id")).append("'>Discussion and voting: ").append(e(d.get("name"))).append("</a></p>");
             b.append("<h4 class=mt-4>Films assigned to me for review</h4>");
             for (var a : db("SELECT s.id,s.tracking_id,s.title,f.name fn,(SELECT COUNT(*) FROM scores sc WHERE sc.submission_id=s.id AND sc.jury_id=a.jury_id) scored FROM assignments a JOIN submissions s ON s.id=a.submission_id JOIN festivals f ON f.id=s.festival_id WHERE a.jury_id=?", uid))
                 b.append("<p><a href='/review?id=").append(a.get("id")).append("'>").append(e(a.get("tracking_id"))).append(" ").append(e(a.get("title"))).append("</a> (").append(e(a.get("fn"))).append(")").append(num(a.get("scored")) > 0 ? " · scored" : " · not scored yet").append("</p>");
@@ -311,6 +321,7 @@ public class Portal extends HttpServlet {
         int sid = Integer.parseInt(need(q, "id"));
         var m = mine(sid, uid);
         if (m.isEmpty()) throw new IllegalArgumentException("This film is not assigned to you.");
+        if (!"SCORING".equals(stage(num(m.get(0).get("festival_id"))))) throw new IllegalArgumentException("Scoring is closed for this festival.");
         var vals = new ArrayList<Object[]>();
         for (var c : db("SELECT id FROM rubric_criteria WHERE festival_id=?", m.get(0).get("festival_id"))) {
             int sc = Integer.parseInt(need(q, "c" + c.get("id")));
@@ -319,6 +330,155 @@ public class Portal extends HttpServlet {
         }
         for (Object[] v : vals) up("INSERT INTO scores(submission_id,jury_id,criterion_id,score) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE score=VALUES(score)", sid, uid, v[0], v[1]);
         r.sendRedirect("/review?id=" + sid);
+    }
+
+    // ---------- Increment 4: shortlist, discussion, voting, tie-break, publish ----------
+    static final String AGG = "SELECT t.sid,AVG(t.total) agg FROM (SELECT sc.submission_id sid,sc.jury_id,SUM(sc.score*rc.weight)/10 total FROM scores sc JOIN rubric_criteria rc ON rc.id=sc.criterion_id JOIN submissions s ON s.id=sc.submission_id WHERE s.festival_id=? AND s.status='ELIGIBLE' GROUP BY sc.submission_id,sc.jury_id) t GROUP BY t.sid ORDER BY agg DESC LIMIT 5";
+
+    static void postOnly(HttpServletRequest q) { if (!q.getMethod().equals("POST")) throw new IllegalArgumentException("Use the button on the page."); }
+    static void adminOf(int fid, int uid) throws Exception { if (db("SELECT 1 x FROM festivals WHERE id=? AND admin_id=?", fid, uid).isEmpty()) throw new IllegalArgumentException("Only the festival's admin can do this."); }
+    static boolean participant(int fid, int uid) throws Exception {
+        return !db("SELECT 1 x FROM festivals WHERE id=? AND admin_id=? UNION SELECT 1 FROM jury_requests WHERE festival_id=? AND user_id=? AND status='APPROVED'", fid, uid, fid, uid).isEmpty();
+    }
+    static Map<String, Object> state(int fid) throws Exception {
+        var r = db("SELECT *,IF(ends_at IS NOT NULL AND ends_at<NOW(),1,0) closed FROM festival_state WHERE festival_id=?", fid);
+        return r.isEmpty() ? null : r.get(0);
+    }
+    static String stage(int fid) throws Exception { var st = state(fid); return st == null ? "SCORING" : (String) st.get("stage"); }
+    static void tellAll(int fid, int adminId, String msg) throws Exception {
+        note(adminId, msg);
+        for (var j : db("SELECT user_id FROM jury_requests WHERE festival_id=? AND status='APPROVED'", fid)) note(num(j.get("user_id")), msg);
+    }
+    /** Active shortlisted films this participant has not yet commented on in the current round. */
+    static int missing(int fid, int uid) throws Exception {
+        return num(db("SELECT COUNT(*) n FROM shortlist sl WHERE sl.festival_id=? AND sl.active=1 AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.submission_id=sl.submission_id AND c.author_id=? AND c.created_at>=(SELECT started_at FROM festival_state WHERE festival_id=sl.festival_id))", fid, uid).get(0).get("n"));
+    }
+
+    void adminStage(StringBuilder b, int fid) throws Exception {
+        var st = state(fid); String stg = st == null ? "SCORING" : (String) st.get("stage");
+        b.append("<h4 class=mt-4>Decision process</h4>");
+        if (stg.equals("SCORING")) { b.append("<form method=post action='/festival/close-scoring'><input type=hidden name=id value=" + fid + "><button class='btn btn-primary'>Close scoring and generate Top 5 shortlist</button></form>"); return; }
+        b.append("<p>Stage: " + stg + " (round " + st.get("round_no") + ")</p><table class=table><tr><th>Rank<th>Film<th>Aggregate score<th>In play</tr>");
+        for (var x : db("SELECT sl.rank_no,sl.aggregate,sl.active,s.tracking_id,s.title FROM shortlist sl JOIN submissions s ON s.id=sl.submission_id WHERE sl.festival_id=? ORDER BY sl.rank_no", fid))
+            b.append("<tr><td>").append(x.get("rank_no")).append("<td>").append(e(x.get("tracking_id"))).append(" ").append(e(x.get("title"))).append("<td>").append(x.get("aggregate")).append("<td>").append(num(x.get("active")) == 1 ? "yes" : "no").append("</tr>");
+        b.append("</table>");
+        if (stg.equals("VOTE")) b.append("<a class='btn btn-primary me-2' href='/discuss?festival=" + fid + "'>Open discussion and voting</a><form method=post action='/festival/tally' class=d-inline><input type=hidden name=id value=" + fid + "><button class='btn btn-outline-dark'>Close voting and tally</button></form>");
+        else if (stg.equals("DECIDED")) {
+            b.append("<form method=post action='/festival/publish' class='col-md-6'><input type=hidden name=id value=" + fid + "><p>Determined winner is preselected. Pick another film to override it.</p><select class='form-select mb-2' name=submission_id>");
+            for (var x : db("SELECT s.id,s.tracking_id,s.title FROM shortlist sl JOIN submissions s ON s.id=sl.submission_id WHERE sl.festival_id=? ORDER BY sl.rank_no", fid))
+                b.append("<option value=").append(x.get("id")).append(num(x.get("id")) == num(st.get("winner_id")) ? " selected" : "").append(">").append(e(x.get("tracking_id"))).append(" ").append(e(x.get("title"))).append("</option>");
+            b.append("</select><input class='form-control mb-2' name=reason placeholder='Reason (required only if you override)'><button class='btn btn-primary'>Confirm and publish</button></form>");
+        }
+    }
+
+    void closeScoring(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int fid = Integer.parseInt(need(q, "id")); adminOf(fid, uid);
+        if (!"SCORING".equals(stage(fid))) throw new IllegalArgumentException("Scoring is already closed.");
+        var top = db(AGG, fid);
+        if (top.isEmpty()) throw new IllegalArgumentException("No films have been scored yet.");
+        int rank = 1;
+        for (var t : top) up("INSERT INTO shortlist(festival_id,submission_id,rank_no,aggregate) VALUES(?,?,?,?)", fid, t.get("sid"), rank++, t.get("agg"));
+        up("INSERT INTO festival_state(festival_id,stage,round_no,started_at,ends_at) VALUES(?,'VOTE',1,NOW(),DATE_ADD(NOW(),INTERVAL 48 HOUR)) ON DUPLICATE KEY UPDATE stage='VOTE',round_no=1,started_at=NOW(),ends_at=DATE_ADD(NOW(),INTERVAL 48 HOUR)", fid);
+        for (var s : db("SELECT s.filmmaker_id,IF(sl.submission_id IS NULL,0,1) inl FROM submissions s LEFT JOIN shortlist sl ON sl.submission_id=s.id WHERE s.festival_id=? AND s.status='ELIGIBLE'", fid))
+            note(num(s.get("filmmaker_id")), num(s.get("inl")) == 1 ? "Your film made the Top 5 shortlist." : "Your film was not shortlisted.");
+        tellAll(fid, uid, "The shortlist is ready. Discuss every film, then vote (48-hour discussion window).");
+        audit(fid, uid, "SHORTLIST_GENERATED", "top " + top.size());
+        r.sendRedirect("/festival?id=" + fid);
+    }
+
+    void discuss(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int fid = Integer.parseInt(need(q, "festival"));
+        if (!participant(fid, uid)) throw new IllegalArgumentException("Only this festival's jury and admin can open this page.");
+        var st = state(fid);
+        if (st == null || "SCORING".equals(st.get("stage"))) throw new IllegalArgumentException("The shortlist has not been generated yet.");
+        boolean open = "VOTE".equals(st.get("stage"));
+        var b = new StringBuilder("<h2>Discussion and voting</h2><p>Round " + st.get("round_no") + " · discussion window closes " + e(st.get("ends_at")) + "</p>");
+        var films = db("SELECT s.id,s.tracking_id,s.title,s.trailer_url,s.film_url FROM shortlist sl JOIN submissions s ON s.id=sl.submission_id WHERE sl.festival_id=? AND sl.active=1 ORDER BY sl.rank_no", fid);
+        for (var f : films) {
+            b.append("<h4 class=mt-4>" + e(f.get("tracking_id")) + ": " + e(f.get("title")) + "</h4><p><a target=_blank rel=noopener href='" + e(f.get("trailer_url")) + "'>Trailer</a> · <a target=_blank rel=noopener href='" + e(f.get("film_url")) + "'>Full film</a></p>");
+            for (var c : db("SELECT u.name,c.body FROM comments c JOIN users u ON u.id=c.author_id WHERE c.submission_id=? ORDER BY c.id", f.get("id")))
+                b.append("<p class=mb-1><b>").append(e(c.get("name"))).append(":</b> ").append(e(c.get("body"))).append("</p>");
+            if (open) b.append("<form method=post action='/comment' class='col-md-8 mt-2'><input type=hidden name=submission_id value=" + f.get("id") + "><textarea class=form-control name=body rows=2 required placeholder='Your comment on this film'></textarea><button class='btn btn-sm btn-primary mt-1'>Post comment</button></form>");
+        }
+        b.append("<h4 class=mt-4>Your vote</h4>");
+        if (!open) b.append("<p>Voting has closed.</p>");
+        else if (!db("SELECT 1 x FROM votes WHERE festival_id=? AND voter_id=? AND round=?", fid, uid, st.get("round_no")).isEmpty()) b.append("<p>Your vote is recorded. Votes can't be changed.</p>");
+        else if (missing(fid, uid) > 0 && num(st.get("closed")) == 0) b.append("<p>Voting unlocks when you have commented on every film above (" + missing(fid, uid) + " left) or the discussion window closes.</p>");
+        else {
+            b.append("<form method=post action='/vote'><input type=hidden name=festival_id value=" + fid + ">");
+            for (var f : films) b.append("<label class=d-block><input type=radio name=submission_id value=" + f.get("id") + " required> " + e(f.get("tracking_id")) + " " + e(f.get("title")) + "</label>");
+            b.append("<button class='btn btn-primary mt-2'>Cast vote</button></form>");
+        }
+        page(q, r, b.toString());
+    }
+
+    void comment(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int sid = Integer.parseInt(need(q, "submission_id"));
+        var f = db("SELECT festival_id FROM shortlist WHERE submission_id=? AND active=1", sid);
+        if (f.isEmpty()) throw new IllegalArgumentException("That film is not open for discussion.");
+        int fid = num(f.get(0).get("festival_id"));
+        if (!participant(fid, uid)) throw new IllegalArgumentException("Only this festival's jury and admin can comment.");
+        if (!"VOTE".equals(stage(fid))) throw new IllegalArgumentException("Discussion is closed.");
+        up("INSERT INTO comments(submission_id,author_id,body) VALUES(?,?,?)", sid, uid, need(q, "body"));
+        r.sendRedirect("/discuss?festival=" + fid);
+    }
+
+    void vote(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int fid = Integer.parseInt(need(q, "festival_id"));
+        if (!participant(fid, uid)) throw new IllegalArgumentException("Only this festival's jury and admin can vote.");
+        var st = state(fid);
+        if (st == null || !"VOTE".equals(st.get("stage"))) throw new IllegalArgumentException("Voting is not open.");
+        if (db("SELECT 1 x FROM shortlist WHERE festival_id=? AND submission_id=? AND active=1", fid, need(q, "submission_id")).isEmpty()) throw new IllegalArgumentException("Choose one of the films in play.");
+        if (missing(fid, uid) > 0 && num(st.get("closed")) == 0) throw new IllegalArgumentException("Comment on every film before voting.");
+        try { up("INSERT INTO votes(festival_id,voter_id,submission_id,round) VALUES(?,?,?,?)", fid, uid, need(q, "submission_id"), st.get("round_no")); }
+        catch (SQLIntegrityConstraintViolationException ex) { throw new IllegalArgumentException("You have already voted in this round."); }
+        r.sendRedirect("/discuss?festival=" + fid);
+    }
+
+    void tally(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int fid = Integer.parseInt(need(q, "id")); adminOf(fid, uid);
+        var st = state(fid);
+        if (st == null || !"VOTE".equals(st.get("stage"))) throw new IllegalArgumentException("Voting is not open.");
+        int rd = num(st.get("round_no"));
+        var res = db("SELECT submission_id sid,COUNT(*) n FROM votes WHERE festival_id=? AND round=? GROUP BY submission_id ORDER BY n DESC", fid, rd);
+        if (res.isEmpty()) throw new IllegalArgumentException("No votes have been cast yet.");
+        long top = ((Number) res.get(0).get("n")).longValue();
+        var tied = new ArrayList<Object>();
+        for (var x : res) if (((Number) x.get("n")).longValue() == top) tied.add(x.get("sid"));
+        if (tied.size() == 1) {
+            up("UPDATE festival_state SET stage='DECIDED',winner_id=? WHERE festival_id=?", tied.get(0), fid);
+            audit(fid, uid, "VOTES_TALLIED", "winner film " + tied.get(0));
+        } else if (rd == 1) {
+            up("UPDATE shortlist SET active=0 WHERE festival_id=?", fid);
+            for (Object t : tied) up("UPDATE shortlist SET active=1 WHERE festival_id=? AND submission_id=?", fid, t);
+            up("UPDATE festival_state SET round_no=2,started_at=NOW(),ends_at=DATE_ADD(NOW(),INTERVAL 24 HOUR) WHERE festival_id=?", fid);
+            tellAll(fid, uid, "The vote is tied. Discuss the tied films again, then revote (24-hour window).");
+            audit(fid, uid, "TIE_BREAK_STARTED", tied.size() + " films tied");
+        } else {
+            var av = db("SELECT submission_id sid FROM votes WHERE festival_id=? AND round=2 AND voter_id=?", fid, uid);
+            if (av.isEmpty() || !tied.contains(av.get(0).get("sid"))) throw new IllegalArgumentException("Still tied. The admin's own round-2 vote for one of the tied films decides it: vote, then tally again.");
+            up("UPDATE festival_state SET stage='DECIDED',winner_id=? WHERE festival_id=?", av.get(0).get("sid"), fid);
+            audit(fid, uid, "TIE_RESOLVED_BY_ADMIN_VOTE", "film " + av.get(0).get("sid"));
+        }
+        r.sendRedirect("/festival?id=" + fid);
+    }
+
+    void publish(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int fid = Integer.parseInt(need(q, "id")); adminOf(fid, uid);
+        var st = state(fid);
+        if (st == null || !"DECIDED".equals(st.get("stage"))) throw new IllegalArgumentException("There is no determined winner to confirm yet.");
+        int win = num(st.get("winner_id")); String reason = null;
+        String ov = q.getParameter("submission_id");
+        if (ov != null && !ov.isBlank() && Integer.parseInt(ov) != win) {
+            if (db("SELECT 1 x FROM shortlist WHERE festival_id=? AND submission_id=?", fid, ov).isEmpty()) throw new IllegalArgumentException("Pick a shortlisted film.");
+            reason = need(q, "reason"); win = Integer.parseInt(ov);
+        }
+        up("INSERT INTO results(festival_id,submission_id,override_reason) VALUES(?,?,?)", fid, win, reason);
+        up("UPDATE festival_state SET stage='PUBLISHED' WHERE festival_id=?", fid);
+        audit(fid, uid, reason == null ? "RESULT_PUBLISHED" : "RESULT_OVERRIDDEN", "film " + win + (reason == null ? "" : ": " + reason));
+        for (var s : db("SELECT s.filmmaker_id,s.id FROM shortlist sl JOIN submissions s ON s.id=sl.submission_id WHERE sl.festival_id=?", fid))
+            note(num(s.get("filmmaker_id")), num(s.get("id")) == win ? "Final result: your film won the festival." : "Final result: your film was shortlisted but did not win.");
+        r.sendRedirect("/festival?id=" + fid);
     }
 
     void poster(HttpServletRequest q, HttpServletResponse r) throws Exception {

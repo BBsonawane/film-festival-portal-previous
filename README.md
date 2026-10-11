@@ -2,8 +2,8 @@
 
 Java Servlets + MySQL + Bootstrap (per SRS v1.0). Built incrementally.
 
-**Done (increments 1-3):** jury assignment, blind review, weighted scoring; role-based register/login (salted PBKDF2), festival creation (creator becomes that festival's admin), jury requests + admin approval, film submission (poster upload, YouTube/Drive link validation), sandbox payment, auto eligibility check, tracking ID, notifications, admin audit trail.
-**Schema ready, UI not yet:** scoring window, shortlist, discussion, voting, tie-break, publish, post-publish comment visibility.
+**Done (increments 1-4):** jury assignment, blind review, weighted scoring, Top 5 shortlist, discussion, voting, tie-break, admin confirm/override; role-based register/login (salted PBKDF2), festival creation (creator becomes that festival's admin), jury requests + admin approval, film submission (poster upload, YouTube/Drive link validation), sandbox payment, auto eligibility check, tracking ID, notifications, admin audit trail.
+**Not yet:** post-publish comment visibility for filmmakers (4.12) and audit-trail search/filter.
 
 ## Run
     docker compose up --build        # http://localhost:8080
