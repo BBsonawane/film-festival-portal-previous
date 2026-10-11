@@ -102,6 +102,7 @@ public class Portal extends HttpServlet {
                     case "/discuss" -> { guard(s, "NONFILMMAKER"); discuss(q, r, uid); }
                     case "/comment" -> { guard(s, "NONFILMMAKER"); postOnly(q); comment(q, r, uid); }
                     case "/vote" -> { guard(s, "NONFILMMAKER"); postOnly(q); vote(q, r, uid); }
+                    case "/result" -> { guard(s, "FILMMAKER"); result(q, r, uid); }
                     case "/poster" -> poster(q, r);
                     default -> r.sendError(404);
                 }
@@ -171,8 +172,11 @@ public class Portal extends HttpServlet {
         }
         b.append("</table>");
         adminStage(b, id);
-        b.append("<h4 class=mt-4>Audit trail</h4><ul class=list-unstyled>");
-        for (var a : db("SELECT action,detail,created_at FROM audit_log WHERE festival_id=? ORDER BY id DESC LIMIT 30", id))
+        String act = q.getParameter("action") == null ? "" : q.getParameter("action"), term = q.getParameter("aq") == null ? "" : q.getParameter("aq").trim();
+        b.append("<h4 class=mt-4>Audit trail</h4><form method=get action='/festival' class='row g-2 mb-3'><input type=hidden name=id value=" + id + "><div class=col-md-4><input class=form-control name=aq placeholder='Search details' value='" + e(term) + "'></div><div class=col-md-4><select class=form-select name=action><option value=''>All actions");
+        for (var x : db("SELECT DISTINCT action FROM audit_log WHERE festival_id=? ORDER BY action", id)) b.append("<option" + (x.get("action").equals(act) ? " selected" : "") + ">" + e(x.get("action")));
+        b.append("</select></div><div class=col-auto><button class='btn btn-primary'>Filter</button></div></form><ul class=list-unstyled>");
+        for (var a : db("SELECT action,detail,created_at FROM audit_log WHERE festival_id=? AND (?='' OR action=?) AND (?='' OR detail LIKE CONCAT('%',?,'%')) ORDER BY id DESC LIMIT 100", id, act, act, term, term))
             b.append("<li>").append(e(a.get("created_at"))).append(" — ").append(e(a.get("action"))).append(" ").append(e(a.get("detail"))).append("</li>");
         page(q, r, b.append("</ul>").toString());
     }
@@ -194,9 +198,10 @@ public class Portal extends HttpServlet {
             for (var f : db("SELECT id,name,deadline FROM festivals WHERE deadline>NOW() ORDER BY deadline"))
                 b.append("<p>").append(e(f.get("name"))).append(" — closes ").append(e(f.get("deadline"))).append(" <a class='btn btn-sm btn-primary' href='/submit?festival=").append(f.get("id")).append("'>Submit a film</a></p>");
             b.append("<h4 class=mt-4>My submissions</h4><table class=table><tr><th>Film<th>Festival<th>Tracking ID<th>Status<th></tr>");
-            for (var s : db("SELECT s.id,s.title,s.status,s.reason,s.tracking_id,f.name fn FROM submissions s JOIN festivals f ON f.id=s.festival_id WHERE s.filmmaker_id=? ORDER BY s.id DESC", uid)) {
+            for (var s : db("SELECT s.id,s.title,s.status,s.reason,s.tracking_id,f.name fn,(SELECT IF(fs.stage='PUBLISHED' AND EXISTS(SELECT 1 FROM shortlist sl WHERE sl.submission_id=s.id),1,0) FROM festival_state fs WHERE fs.festival_id=s.festival_id) pub FROM submissions s JOIN festivals f ON f.id=s.festival_id WHERE s.filmmaker_id=? ORDER BY s.id DESC", uid)) {
                 b.append("<tr><td>").append(e(s.get("title"))).append("<td>").append(e(s.get("fn"))).append("<td>").append(e(s.get("tracking_id"))).append("<td>").append(s.get("status")).append(" ").append(e(s.get("reason"))).append("<td>");
                 if ("PENDING_PAYMENT".equals(s.get("status"))) b.append("<a href='/pay?id=").append(s.get("id")).append("'>Pay now</a>");
+                else if (s.get("pub") != null && num(s.get("pub")) == 1) b.append("<a href='/result?id=").append(s.get("id")).append("'>View result and discussion</a>");
                 b.append("</tr>");
             }
             b.append("</table>");
@@ -477,8 +482,23 @@ public class Portal extends HttpServlet {
         up("UPDATE festival_state SET stage='PUBLISHED' WHERE festival_id=?", fid);
         audit(fid, uid, reason == null ? "RESULT_PUBLISHED" : "RESULT_OVERRIDDEN", "film " + win + (reason == null ? "" : ": " + reason));
         for (var s : db("SELECT s.filmmaker_id,s.id FROM shortlist sl JOIN submissions s ON s.id=sl.submission_id WHERE sl.festival_id=?", fid))
-            note(num(s.get("filmmaker_id")), num(s.get("id")) == win ? "Final result: your film won the festival." : "Final result: your film was shortlisted but did not win.");
+            note(num(s.get("filmmaker_id")), num(s.get("id")) == win ? "Final result: your film won the festival. The jury discussion on your film is now viewable." : "Final result: your film was shortlisted but did not win. The jury discussion on your film is now viewable.");
         r.sendRedirect("/festival?id=" + fid);
+    }
+
+    // ---------- Increment 5: post-publish visibility ----------
+    /** The comments query selects no author columns, so reviewer identity never reaches the filmmaker (REQ-12.3). */
+    void result(HttpServletRequest q, HttpServletResponse r, int uid) throws Exception {
+        int sid = Integer.parseInt(need(q, "id"));
+        var m = db("SELECT s.title,s.tracking_id,fs.stage,res.submission_id win FROM submissions s JOIN festival_state fs ON fs.festival_id=s.festival_id LEFT JOIN results res ON res.festival_id=s.festival_id WHERE s.id=? AND s.filmmaker_id=?", sid, uid);
+        if (m.isEmpty() || !"PUBLISHED".equals(m.get(0).get("stage")) || db("SELECT 1 x FROM shortlist WHERE submission_id=?", sid).isEmpty())
+            throw new IllegalArgumentException("The result and discussion for this film are not available.");
+        var f = m.get(0);
+        boolean won = f.get("win") != null && num(f.get("win")) == sid;
+        var b = new StringBuilder("<h2>" + e(f.get("tracking_id")) + ": " + e(f.get("title")) + "</h2><p class=lead>" + (won ? "Your film won the festival." : "Your film was shortlisted but did not win.") + "</p><h4 class=mt-4>Jury and admin discussion</h4>");
+        for (var c : db("SELECT body,created_at FROM comments WHERE submission_id=? ORDER BY id", sid))
+            b.append("<p class=mb-2>").append(e(c.get("body"))).append("<br><small>").append(e(c.get("created_at"))).append("</small></p>");
+        page(q, r, b.toString());
     }
 
     void poster(HttpServletRequest q, HttpServletResponse r) throws Exception {
